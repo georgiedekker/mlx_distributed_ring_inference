@@ -146,7 +146,7 @@ mlx_distributed_ring_inference/
 
 ## License
 
-[Your License Here]
+MIT License
 
 ## Acknowledgments
 
