@@ -1,0 +1,51 @@
+🚀 MLX Distributed with Identical Paths
+========================================
+Launching unified distributed job from identical path...
+
+2025-08-08 15:22:01,820 - INFO - MLX distributed is available, initializing...
+[ring] Rank 0 accepting
+2025-08-08 15:22:02,823 - INFO - MLX distributed is available, initializing...
+[ring] Rank 1 connecting to 0
+[ring] Rank 1 accepting
+[ring] Rank 0 connecting to 1
+2025-08-08 15:22:02,826 - INFO - ✅ MLX distributed initialized: rank 1/2
+2025-08-08 15:22:02,820 - INFO - ✅ MLX distributed initialized: rank 0/2
+2025-08-08 15:22:02,830 - INFO - 🎉 All 2 devices connected and communicating!
+2025-08-08 15:22:02,830 - INFO - Communication test passed: sum=1.0 (expected 1)
+2025-08-08 15:22:02,830 - INFO - [Rank 1] Initializing MoE model...
+2025-08-08 15:22:02,830 - INFO - [Rank 1] Handling layers 8-15
+2025-08-08 15:22:02,822 - INFO - 🎉 All 2 devices connected and communicating!
+2025-08-08 15:22:02,822 - INFO - Communication test passed: sum=1.0 (expected 1)
+2025-08-08 15:22:02,822 - INFO - [Rank 0] Initializing MoE model...
+2025-08-08 15:22:02,822 - INFO - [Rank 0] Handling layers 0-7
+2025-08-08 15:22:02,832 - INFO - [Rank 1] Initializing model weights...
+2025-08-08 15:22:02,828 - INFO - [Rank 0] Initializing model weights...
+2025-08-08 15:22:03,004 - INFO - [Rank 1] Model loaded, GPU memory: 1.11 GB
+2025-08-08 15:22:03,004 - INFO - Rank 1 running as worker, waiting for requests...
+2025-08-08 15:22:03,015 - INFO - [Rank 0] Model loaded, GPU memory: 1.11 GB
+2025-08-08 15:22:03,015 - INFO - Starting API server on rank 0...
+INFO:     Started server process [89452]
+INFO:     Waiting for application startup.
+2025-08-08 15:22:03,036 - INFO - 
+        ========================================
+        MoE Distributed Inference Server Ready!
+        ========================================
+        Rank: 0/2
+        Model: Qwen-MoE-Mini
+        Layers: 0-15
+        Experts: 8 (selecting 2)
+        API: http://localhost:8100
+        ========================================
+        
+INFO:     Application startup complete.
+INFO:     Uvicorn running on http://0.0.0.0:8100 (Press CTRL+C to quit)
+2025-08-08 15:22:11,160 - INFO - Generating response for prompt: What is the square root of 454...
+2025-08-08 15:22:11,260 - ERROR - Error in chat completion: Too many indices for array with 2 dimensions.
+INFO:     192.168.2.106:50990 - "POST /v1/chat/completions HTTP/1.1" 500 Internal Server Error
+2025-08-08 15:22:18,202 - INFO - Generating response for prompt: What is the square root of 484...
+2025-08-08 15:22:18,289 - ERROR - Error in chat completion: Too many indices for array with 2 dimensions.
+INFO:     192.168.2.106:50991 - "POST /v1/chat/completions HTTP/1.1" 500 Internal Server Error
+2025-08-08 15:22:22,223 - INFO - Generating response for prompt: What is the square root of 484...
+2025-08-08 15:22:22,324 - ERROR - Error in chat completion: Too many indices for array with 2 dimensions.
+INFO:     192.168.2.106:50991 - "POST /v1/chat/completions HTTP/1.1" 500 Internal Server Error
+/Users/Shared/mlx_distributed/launch_unified.sh: line 28: 89446 Terminated: 15          mlx.launch --hostfile hosts.json --backend ring --verbose python3 server_moe.py
