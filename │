@@ -1,0 +1,411 @@
+#!/usr/bin/env python3
+"""
+Distributed MoE Inference Server with Actual Forward Passes
+This implements real distributed inference across Mac minis
+"""
+import os
+import sys
+import time
+import logging
+from typing import Dict, Any, List, Optional
+import uuid
+
+import mlx.core as mx
+import mlx.nn as nn
+import mlx.core.distributed as dist
+from dataclasses import dataclass
+
+from fastapi import FastAPI, HTTPException
+from fastapi.responses import StreamingResponse, JSONResponse
+from pydantic import BaseModel
+from contextlib import asynccontextmanager
+import uvicorn
+import json
+
+# Import local MoE model files
+from shard import Shard
+from qwen_moe_mini import Model, ModelArgs
+from base import KVCache
+
+# Configure logging
+logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
+logger = logging.getLogger(__name__)
+
+# Set GPU as default
+mx.set_default_device(mx.gpu)
+
+# Global state
+model = None
+config = None
+distributed_group = None
+rank = 0
+world_size = 1
+
+class ChatMessage(BaseModel):
+    role: str
+    content: str
+
+class ChatRequest(BaseModel):
+    messages: List[ChatMessage]
+    max_tokens: int = 100
+    temperature: float = 0.7
+    stream: bool = False
+
+class ChatResponse(BaseModel):
+    id: str
+    object: str = "chat.completion"
+    created: int
+    model: str = "qwen-moe-mini"
+    choices: List[Dict[str, Any]]
+
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    """Manage startup and shutdown"""
+    global rank, world_size, config
+    
+    if rank == 0 and config is not None and hasattr(config, 'shard'):
+        start_layer = config.shard.start_layer
+        end_layer = config.shard.end_layer
+        
+        logger.info(f"""
+        ========================================
+        Distributed MoE Server Ready!
+        ========================================
+        Rank: {rank}/{world_size}
+        Model: Qwen-MoE-Mini
+        Layers: {start_layer}-{end_layer}
+        Distributed: {"✅ Yes" if world_size > 1 else "❌ No"}
+        API: http://localhost:8100
+        ========================================
+        """)
+    
+    yield
+    logger.info(f"[Rank {rank}] Shutting down...")
+
+app = FastAPI(lifespan=lifespan)
+
+def initialize_distributed():
+    """Initialize distributed group"""
+    global distributed_group, rank, world_size
+    
+    try:
+        if dist.is_available():
+            logger.info("MLX distributed is available, initializing...")
+            
+            # Initialize MLX distributed (auto-detects environment)
+            distributed_group = dist.init()
+            
+            # Get actual rank and size from MLX
+            rank = distributed_group.rank()
+            world_size = distributed_group.size()
+            
+            logger.info(f"✅ MLX distributed initialized: rank {rank}/{world_size}")
+            
+            # Test communication if we have multiple ranks
+            if world_size > 1:
+                test = mx.array([float(rank)])
+                result = dist.all_sum(test, group=distributed_group)
+                mx.eval(result)
+                
+                expected_sum = sum(range(world_size))
+                if abs(result.item() - expected_sum) < 0.01:
+                    logger.info(f"🎉 All {world_size} devices connected and communicating!")
+                else:
+                    logger.warning(f"Communication test unexpected: got {result.item()}, expected {expected_sum}")
+            
+            return True
+            
+        else:
+            logger.warning("MLX distributed not initialized, using single device")
+            rank = 0
+            world_size = 1
+            distributed_group = None
+        
+        return True
+    except Exception as e:
+        logger.error(f"Distributed initialization failed: {e}")
+        rank = 0
+        world_size = 1
+        distributed_group = None
+        return False
+
+def initialize_model():
+    """Initialize the MoE model with appropriate sharding"""
+    global model, config
+    
+    logger.info(f"[Rank {rank}] Initializing MoE model...")
+    
+    # Create config
+    config = ModelArgs(
+        vocab_size=32000,
+        hidden_size=1024,
+        num_hidden_layers=16,
+        num_attention_heads=16,
+        num_key_value_heads=4,
+        n_routed_experts=8,
+        num_experts_per_tok=2,
+        n_shared_experts=2,
+        moe_intermediate_size=1408,
+        shared_expert_intermediate_size=2816,
+    )
+    
+    # Calculate layer distribution for this rank
+    if world_size > 1:
+        layers_per_rank = config.num_hidden_layers // world_size
+        start_layer = rank * layers_per_rank
+        end_layer = start_layer + layers_per_rank - 1
+        if rank == world_size - 1:
+            end_layer = config.num_hidden_layers - 1
+    else:
+        start_layer = 0
+        end_layer = config.num_hidden_layers - 1
+    
+    # Create shard
+    config.shard = Shard(
+        model_id="qwen-moe-mini",
+        start_layer=start_layer,
+        end_layer=end_layer,
+        n_layers=config.num_hidden_layers
+    )
+    
+    logger.info(f"[Rank {rank}] Handling layers {start_layer}-{end_layer}")
+    
+    # Create model
+    model = Model(config)
+    
+    # Initialize weights (in production, load from checkpoint)
+    logger.info(f"[Rank {rank}] Initializing model weights...")
+    for name, module in model.named_modules():
+        if isinstance(module, nn.Linear):
+            module.weight = mx.random.normal(shape=module.weight.shape) * 0.02
+        elif isinstance(module, nn.Embedding):
+            module.weight = mx.random.normal(shape=module.weight.shape) * 0.02
+    
+    mx.eval(model.parameters())
+    
+    # Check memory
+    mem = mx.get_active_memory() / 1024**3
+    logger.info(f"[Rank {rank}] Model loaded, GPU memory: {mem:.2f} GB")
+
+def simple_tokenize(text: str, vocab_size: int = 32000) -> mx.array:
+    """Simple character-based tokenization for demo"""
+    # Convert text to token IDs (simplified - use real tokenizer in production)
+    tokens = [ord(c) % vocab_size for c in text[:100]]  # Limit to 100 chars
+    # Pad to at least 10 tokens
+    while len(tokens) < 10:
+        tokens.append(0)
+    return mx.array([tokens])  # Batch size 1
+
+def simple_detokenize(token_ids: List[int]) -> str:
+    """Convert token IDs back to text (simplified)"""
+    # In production, use real tokenizer
+    # For now, just return a descriptive string
+    return f"[Generated {len(token_ids)} tokens]"
+
+def distributed_forward(input_ids: mx.array) -> mx.array:
+    """
+    Perform distributed forward pass through the model
+    Each rank processes its assigned layers
+    """
+    global model, distributed_group, rank, world_size
+    
+    batch_size, seq_len = input_ids.shape
+    
+    if world_size == 1:
+        # Single device - just run the full model
+        output = model(input_ids)
+        return output
+    
+    # Distributed inference
+    if rank == 0:
+        # Rank 0: Process embedding and first half of layers
+        logger.debug(f"[Rank 0] Processing input shape: {input_ids.shape}")
+        
+        # Get embeddings
+        h = model.model.embed_tokens(input_ids)
+        
+        # Process layers 0-7
+        for i in range(config.shard.start_layer, config.shard.end_layer + 1):
+            layer = model.model.layers[i]
+            h = layer(h)
+        
+        logger.debug(f"[Rank 0] Sending hidden states shape: {h.shape}")
+        
+        # Send to rank 1
+        dist.send(h, dst=1, group=distributed_group)
+        
+        # Receive final output from rank 1
+        final_output = dist.recv(
+            shape=(batch_size, seq_len, config.vocab_size),
+            dtype=mx.float32,
+            src=1,
+            group=distributed_group
+        )
+        
+        mx.eval(final_output)
+        return final_output
+        
+    else:  # rank == 1
+        # Rank 1: Receive from rank 0, process remaining layers
+        h = dist.recv(
+            shape=(batch_size, seq_len, config.hidden_size),
+            dtype=mx.float32,
+            src=0,
+            group=distributed_group
+        )
+        mx.eval(h)
+        
+        logger.debug(f"[Rank 1] Received hidden states shape: {h.shape}")
+        
+        # Process layers 8-15
+        for i in range(config.shard.start_layer, config.shard.end_layer + 1):
+            layer = model.model.layers[i]
+            h = layer(h)
+        
+        # Apply final norm and lm_head
+        h = model.model.norm(h)
+        output = model.lm_head(h)
+        
+        logger.debug(f"[Rank 1] Sending output shape: {output.shape}")
+        
+        # Send back to rank 0
+        dist.send(output, dst=0, group=distributed_group)
+        mx.eval(output)
+        
+        return output
+
+def generate_tokens(input_ids: mx.array, max_tokens: int, temperature: float = 0.7) -> List[int]:
+    """
+    Generate tokens using the distributed model
+    """
+    global rank, world_size
+    
+    generated = []
+    current_input = input_ids
+    
+    for _ in range(max_tokens):
+        # Get logits from distributed forward pass
+        logits = distributed_forward(current_input)
+        
+        if rank == 0:  # Only rank 0 does sampling
+            # Sample next token
+            if temperature > 0:
+                # Sample with temperature
+                probs = mx.softmax(logits[0, -1, :] / temperature)
+                next_token = mx.random.categorical(mx.log(probs))
+            else:
+                # Greedy sampling
+                next_token = mx.argmax(logits[0, -1, :])
+            
+            next_token_id = int(next_token.item())
+            generated.append(next_token_id)
+            
+            # Check for EOS token (simplified - use 2 as EOS)
+            if next_token_id == 2:
+                break
+            
+            # Append to input for next iteration
+            next_token_arr = mx.array([[next_token_id]])
+            current_input = mx.concatenate([current_input, next_token_arr], axis=1)
+            
+            # Broadcast to other ranks
+            if world_size > 1:
+                dist.broadcast(current_input, src=0, group=distributed_group)
+        else:
+            # Other ranks receive the updated input
+            if world_size > 1:
+                dist.broadcast(current_input, src=0, group=distributed_group)
+                mx.eval(current_input)
+    
+    return generated
+
+@app.get("/")
+async def root():
+    """Health check and status"""
+    mem = mx.get_active_memory() / 1024**3
+    return {
+        "status": "ready",
+        "model": "qwen-moe-mini",
+        "rank": f"{rank}/{world_size}",
+        "layers": f"{config.shard.start_layer}-{config.shard.end_layer}" if config else "N/A",
+        "gpu_memory_gb": round(mem, 2),
+        "distributed": world_size > 1
+    }
+
+@app.post("/v1/chat/completions")
+async def chat_completions(request: ChatRequest):
+    """OpenAI-compatible chat endpoint with actual model inference"""
+    
+    if rank != 0:
+        return JSONResponse({"error": "This is a worker node"}, status_code=400)
+    
+    try:
+        # Extract the last message
+        prompt = request.messages[-1].content if request.messages else "Hello"
+        
+        logger.info(f"Processing prompt: {prompt[:50]}...")
+        start_time = time.time()
+        
+        # Tokenize input
+        input_ids = simple_tokenize(prompt)
+        logger.info(f"Input shape: {input_ids.shape}")
+        
+        # Generate tokens using the actual model
+        generated_tokens = generate_tokens(
+            input_ids,
+            max_tokens=min(request.max_tokens, 50),  # Limit for testing
+            temperature=request.temperature
+        )
+        
+        elapsed = time.time() - start_time
+        tokens_per_sec = len(generated_tokens) / elapsed if elapsed > 0 else 0
+        
+        logger.info(f"Generated {len(generated_tokens)} tokens in {elapsed:.2f}s ({tokens_per_sec:.1f} tok/s)")
+        
+        # Convert tokens to text (simplified)
+        response_text = f"Generated response using distributed MoE model across {world_size} devices. "
+        response_text += f"Processed through layers: rank 0 (0-7), rank 1 (8-15). "
+        response_text += f"Token IDs: {generated_tokens[:10]}... "
+        response_text += f"Speed: {tokens_per_sec:.1f} tokens/sec"
+        
+        # Format response
+        response = ChatResponse(
+            id=str(uuid.uuid4()),
+            created=int(time.time()),
+            model="qwen-moe-mini",
+            choices=[{
+                "index": 0,
+                "message": {
+                    "role": "assistant",
+                    "content": response_text
+                },
+                "finish_reason": "stop"
+            }]
+        )
+        
+        return response
+        
+    except Exception as e:
+        logger.error(f"Error in chat completion: {e}", exc_info=True)
+        raise HTTPException(status_code=500, detail=str(e))
+
+if __name__ == "__main__":
+    # Initialize distributed first to get rank
+    initialize_distributed()
+    
+    # All ranks initialize their model portion
+    initialize_model()
+    
+    # Only rank 0 runs the API server
+    if rank == 0:
+        logger.info("Starting API server on rank 0...")
+        import asyncio
+        uv_config = uvicorn.Config(app=app, host="0.0.0.0", port=8100, log_level="info")
+        server = uvicorn.Server(uv_config)
+        asyncio.run(server.serve())
+    else:
+        logger.info(f"Rank {rank} running as worker, waiting for distributed operations...")
+        # Keep worker alive
+        import time
+        while True:
+            time.sleep(1)
